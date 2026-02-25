@@ -6,7 +6,6 @@ defmodule AppworkTakeHome.CacheTest do
   @cache AppworkTakeHome.Cache
   @upstream_latency_ms 100
 
-  @tag :skip
   test "100 concurrent requests prove both concurrency and caching" do
     n = 100
     requests = Enum.map(1..n, fn i -> %Request{params: %{n: i}} end)

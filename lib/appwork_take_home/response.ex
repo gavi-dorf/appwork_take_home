@@ -5,4 +5,6 @@ defmodule AppworkTakeHome.Response do
 
   @enforce_keys [:data]
   defstruct [:data]
+
+  @type t() :: %__MODULE__{data: term()}
 end

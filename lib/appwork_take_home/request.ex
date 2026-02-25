@@ -9,6 +9,8 @@ defmodule AppworkTakeHome.Request do
   @enforce_keys [:params]
   defstruct [:params]
 
+  @type t() :: %__MODULE__{params: term()}
+
   @doc "Returns a nearly-unique integer hash for use as a cache key."
   @spec cache_key(%__MODULE__{}) :: integer()
   def cache_key(%__MODULE__{params: params}), do: :erlang.phash2(params)
