@@ -1,6 +1,8 @@
 # AppworkTakeHome
 
-**TODO: Add description**
+## Assumptions when interpreting instructions:
+1. "Uses request structs as keys and response structs as values...Same as V1, with the added constraint that the stored entries are distinct request-response tuples." - At the implementation level, the hash is used as the ETS key, and the value is the response
+2. "V1 - Basic Cache...It must store responses for at least the last CAP requests" - CAP is treated as maximum capacity and eviction occurs when capacity is exceeded
 
 ## Installation
 
