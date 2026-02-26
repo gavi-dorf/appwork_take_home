@@ -8,9 +8,23 @@ defmodule AppworkTakeHome.Cache do
   via `:persistent_term` so that `fetch/2` can reach them without going
   through the GenServer on either the read or the upstream-call path.
 
-  Eviction is FIFO (V1). The same entry is never stored twice — a cache hit
-  does not update the entry's position in the eviction queue (that is V2 LRU
-  behaviour).
+  Eviction is LRU (V2). A cache hit moves the entry to the most-recently-used
+  position, so only entries not accessed within the last CAP distinct requests
+  are evicted.
+
+  Two ETS tables maintain the LRU order:
+
+    * `table` — the main store: `{key, counter, response}`. The counter is a
+      monotonic integer that encodes the entry's last-access time.
+    * `order_table` — an `:ordered_set` keyed by counter: `{counter, key}`.
+      Because `:ordered_set` sorts ascending, `:ets.first/1` always returns
+      the LRU entry's counter in O(log n) because ordered_set is implemented
+      using a binary search tree.
+
+  On a cache hit, the GenServer is called to update the entry's counter in
+  both tables (touch), moving it to the MRU position.  On a cache miss the
+  upstream is called concurrently (outside the GenServer), and only the
+  subsequent write is serialised.
   """
 
   use GenServer
@@ -43,9 +57,11 @@ defmodule AppworkTakeHome.Cache do
   available or delegating to the upstream service otherwise.
 
   Concurrent calls are safe: ETS reads and upstream calls both bypass the
-  GenServer entirely, so many can proceed in parallel.
+  GenServer entirely, so many can proceed in parallel.  Cache hits also
+  update the LRU position via a lightweight GenServer call (bookkeeping only;
+  the response is already in hand).
   """
-  @spec fetch(cache :: GenServer.server(), request :: Request.t()) ::
+  @spec fetch(cache :: pid() | atom(), request :: Request.t()) ::
           Response.t()
   def fetch(cache, %Request{} = request) do
     key = Request.cache_key(request)
@@ -53,7 +69,8 @@ defmodule AppworkTakeHome.Cache do
     %{table: table, upstream: upstream} = :persistent_term.get({__MODULE__, pid})
 
     case :ets.lookup(table, key) do
-      [{^key, response}] ->
+      [{^key, _counter, response}] ->
+        GenServer.call(cache, {:touch, key})
         response
 
       [] ->
@@ -73,31 +90,63 @@ defmodule AppworkTakeHome.Cache do
     upstream = Keyword.get(opts, :upstream, SlowUpstream)
 
     table = :ets.new(__MODULE__, [:public, {:read_concurrency, true}])
+    order_table = :ets.new(:lru_order, [:ordered_set, :private])
     :persistent_term.put({__MODULE__, self()}, %{table: table, upstream: upstream})
 
-    {:ok, %{table: table, queue: :queue.new(), cap: cap}}
+    {:ok, %{table: table, order_table: order_table, cap: cap}}
   end
 
   @impl true
-  def handle_call({:put, key, response}, _from, %{table: table} = state) do
+  def handle_call({:touch, key}, _from, %{table: table, order_table: order_table} = state) do
+    case :ets.lookup(table, key) do
+      [{^key, old_counter, _response}] ->
+        new_counter = :erlang.unique_integer([:monotonic])
+        :ets.delete(order_table, old_counter)
+        :ets.insert(order_table, {new_counter, key})
+        :ets.update_element(table, key, [{2, new_counter}])
+
+      [] ->
+        # Entry was evicted between the ETS read in fetch/2 and this call.
+        :ok
+    end
+
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call({:put, key, response}, _from, %{table: table, order_table: order_table} = state) do
     state =
       if :ets.member(table, key) do
-        # A concurrent caller already inserted this key; skip to avoid a
-        # duplicate entry in the eviction queue.
+        # A concurrent caller already inserted this key.  Treat as a touch so
+        # the entry moves to the MRU position rather than being silently skipped.
+        case :ets.lookup(table, key) do
+          [{^key, old_counter, _}] ->
+            new_counter = :erlang.unique_integer([:monotonic])
+            :ets.delete(order_table, old_counter)
+            :ets.insert(order_table, {new_counter, key})
+            :ets.update_element(table, key, [{2, new_counter}])
+
+          [] ->
+            # Evicted between the member check and lookup; nothing to do.
+            :ok
+        end
+
         state
       else
-        :ets.insert(table, {key, response})
-        new_queue = :queue.in(key, state.queue)
-        maybe_evict(%{state | queue: new_queue})
+        counter = :erlang.unique_integer([:monotonic])
+        :ets.insert(table, {key, counter, response})
+        :ets.insert(order_table, {counter, key})
+        maybe_evict(state)
       end
 
     {:reply, :ok, state}
   end
 
   @impl true
-  def terminate(_reason, %{table: table}) do
+  def terminate(_reason, %{table: table, order_table: order_table}) do
     :persistent_term.erase({__MODULE__, self()})
     :ets.delete(table)
+    :ets.delete(order_table)
     :ok
   end
 
@@ -105,11 +154,13 @@ defmodule AppworkTakeHome.Cache do
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  defp maybe_evict(%{table: table, queue: queue, cap: cap} = state) do
+  defp maybe_evict(%{table: table, order_table: order_table, cap: cap} = state) do
     if :ets.info(table, :size) > cap do
-      {{:value, oldest_key}, rest} = :queue.out(queue)
-      :ets.delete(table, oldest_key)
-      %{state | queue: rest}
+      oldest_counter = :ets.first(order_table)
+      [{^oldest_counter, lru_key}] = :ets.lookup(order_table, oldest_counter)
+      :ets.delete(order_table, oldest_counter)
+      :ets.delete(table, lru_key)
+      state
     else
       state
     end
