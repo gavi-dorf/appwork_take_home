@@ -21,11 +21,36 @@ defmodule AppworkTakeHome.CacheTest.DelayedUpstream do
   end
 end
 
+defmodule AppworkTakeHome.CacheTest.SpyUpstream do
+  @moduledoc """
+  Instant upstream mock that notifies a designated listener process on every
+  call.  Include `spy: pid` in the request params; the listener receives
+  `{:upstream_called, params}` each time this upstream is invoked, enabling
+  deterministic hit/miss detection without timing sensitivity.
+  """
+  alias AppworkTakeHome.{Request, Response}
+
+  def fetch(%Request{params: %{spy: pid} = params}) do
+    send(pid, {:upstream_called, params})
+    %Response{data: params}
+  end
+end
+
 defmodule AppworkTakeHome.CacheTest do
   use ExUnit.Case
 
   alias AppworkTakeHome.{Cache, Request, Response}
-  alias AppworkTakeHome.CacheTest.{DelayedUpstream, FastUpstream}
+  alias AppworkTakeHome.CacheTest.{DelayedUpstream, FastUpstream, SpyUpstream}
+
+  # Drains all `{tag, _}` messages from the test process mailbox and returns
+  # the count.  Uses `after 0` so it never blocks.
+  defp drain_count(tag, acc \\ 0) do
+    receive do
+      {^tag, _} -> drain_count(tag, acc + 1)
+    after
+      0 -> acc
+    end
+  end
 
   @cache AppworkTakeHome.Cache
 
@@ -155,5 +180,168 @@ defmodule AppworkTakeHome.CacheTest do
     elapsed = System.monotonic_time(:millisecond) - t
 
     assert elapsed < 5, "A should still be cached under LRU, got #{elapsed}ms"
+  end
+
+  # ---------------------------------------------------------------------------
+  # Additional V2 correctness tests (deterministic, no timing sensitivity)
+  # ---------------------------------------------------------------------------
+
+  test "sequential evictions leave no ghost counters in the order table" do
+    # With cap=1 each new fetch evicts the previous entry.  If a previous
+    # eviction left a ghost counter in order_table, re-inserting A would consume
+    # that ghost instead of evicting B, silently leaving both A and B in the
+    # cache.  Observable consequence: B would be a hit when it should be a miss.
+    {:ok, cache} = Cache.start_link(cap: 1, upstream: SpyUpstream)
+
+    req_a = %Request{params: %{id: :a, spy: self()}}
+    req_b = %Request{params: %{id: :b, spy: self()}}
+
+    # miss: insert A, cache [A]
+    Cache.fetch(cache, req_a)
+    # miss: insert B, evict A, cache [B]
+    Cache.fetch(cache, req_b)
+    assert_received {:upstream_called, %{id: :a}}
+    assert_received {:upstream_called, %{id: :b}}
+
+    # miss: insert A, must evict B, cache [A]
+    Cache.fetch(cache, req_a)
+    assert_received {:upstream_called, %{id: :a}}
+
+    Cache.fetch(cache, req_b)
+
+    assert_received {:upstream_called, %{id: :b}},
+                    "B should have been evicted when A was re-inserted; a ghost counter would prevent this"
+  end
+
+  test "concurrent misses on the same key all return the correct response and leave the key cached" do
+    # The GenServer deduplicates concurrent puts for the same key via the
+    # ets.member check in handle_call({:put}).  This test verifies that
+    # (a) every concurrent caller gets the correct response, and
+    # (b) the key is properly cached afterwards — no crash, no corruption.
+    {:ok, cache} = Cache.start_link(cap: 10, upstream: SpyUpstream)
+    req = %Request{params: %{id: :shared, spy: self()}}
+    n = 50
+
+    results =
+      1..n
+      |> Task.async_stream(fn _ -> Cache.fetch(cache, req) end,
+        max_concurrency: n,
+        timeout: 5_000
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert Enum.all?(results, &(&1 == %Response{data: %{id: :shared, spy: self()}}))
+
+    # There should only be one upstream call for the shared key, not n calls.
+    assert drain_count(:upstream_called) == 1,
+           "expected 1 upstream call for concurrent misses on the same key, got multiple"
+
+    # The key must now be cached — no further upstream call.
+    Cache.fetch(cache, req)
+    refute_received {:upstream_called, _}, "subsequent fetch must be a cache hit"
+  end
+
+  test "touching a middle-ordered entry makes the oldest entry the LRU eviction target" do
+    # With cap=3 and LRU order A(oldest) < B < C(newest), touching B promotes
+    # it to MRU: new order A(LRU) < C < B.  Inserting D must evict A, not B or C.
+    {:ok, cache} = Cache.start_link(cap: 3, upstream: SpyUpstream)
+    req_a = %Request{params: %{id: :a, spy: self()}}
+    req_b = %Request{params: %{id: :b, spy: self()}}
+    req_c = %Request{params: %{id: :c, spy: self()}}
+    req_d = %Request{params: %{id: :d, spy: self()}}
+
+    # miss
+    Cache.fetch(cache, req_a)
+    # miss
+    Cache.fetch(cache, req_b)
+    # miss
+    Cache.fetch(cache, req_c)
+    for _ <- 1..3, do: assert_received({:upstream_called, _})
+
+    # hit: B becomes MRU; order: A(LRU) < C < B
+    Cache.fetch(cache, req_b)
+
+    # miss: insert D, evict A (LRU)
+    Cache.fetch(cache, req_d)
+    # D call
+    assert_received {:upstream_called, %{id: :d}}
+
+    # Check hits first: a hit only touches the entry (no eviction), so checking
+    # B and C does not change the cache size or evict anything.
+    Cache.fetch(cache, req_b)
+    refute_received {:upstream_called, _}, "B should still be cached (was touched)"
+
+    Cache.fetch(cache, req_c)
+    refute_received {:upstream_called, _}, "C should still be cached (newer than A)"
+
+    # Check the miss last: re-inserting A will evict the current LRU (D by this
+    # point, since B and C were just touched), which is fine — we only care that
+    # A itself is a miss.
+    Cache.fetch(cache, req_a)
+
+    assert_received {:upstream_called, %{id: :a}},
+                    "A should have been evicted (it was the LRU when D was inserted)"
+  end
+
+  test "touching the oldest entry saves it; the second-oldest becomes the new LRU" do
+    # With cap=2 and order A(LRU) < B, touching A makes B the new LRU.
+    # Inserting C must then evict B, not A.
+    # Complements the timing-based :v2 test with a deterministic spy approach
+    # that also explicitly verifies B was evicted (not just that A survived).
+    {:ok, cache} = Cache.start_link(cap: 2, upstream: SpyUpstream)
+    req_a = %Request{params: %{id: :a, spy: self()}}
+    req_b = %Request{params: %{id: :b, spy: self()}}
+    req_c = %Request{params: %{id: :c, spy: self()}}
+
+    # miss
+    Cache.fetch(cache, req_a)
+    # miss
+    Cache.fetch(cache, req_b)
+    for _ <- 1..2, do: assert_received({:upstream_called, _})
+
+    # hit: A (LRU) becomes MRU; order: B(LRU) < A
+    Cache.fetch(cache, req_a)
+
+    # miss: insert C, evict B (LRU)
+    Cache.fetch(cache, req_c)
+    # C call
+    assert_received {:upstream_called, %{id: :c}}
+
+    # Check A first (while it is definitely still in cache).
+    Cache.fetch(cache, req_a)
+    refute_received {:upstream_called, _}, "A should still be cached (was touched)"
+
+    Cache.fetch(cache, req_b)
+
+    assert_received {:upstream_called, %{id: :b}},
+                    "B should have been evicted (it became LRU when A was touched)"
+  end
+
+  test "repeated touches keep an entry alive through many eviction rounds" do
+    # With cap=2, priming A then repeatedly touching A before each new insert
+    # must keep A in cache indefinitely: the touch makes A the MRU so the
+    # newcomer from the previous round is always the LRU that gets evicted.
+    {:ok, cache} = Cache.start_link(cap: 2, upstream: SpyUpstream)
+    req_a = %Request{params: %{id: :a, spy: self()}}
+
+    # prime A; 1 upstream call
+    Cache.fetch(cache, req_a)
+    assert_received {:upstream_called, %{id: :a}}
+
+    for i <- 1..10 do
+      req_new = %Request{params: %{id: {:new, i}, spy: self()}}
+      # hit: A becomes MRU
+      Cache.fetch(cache, req_a)
+      # miss: insert newcomer, evict previous
+      Cache.fetch(cache, req_new)
+    end
+
+    # 10 newcomer misses; the 10 A touches were all hits.
+    for _ <- 1..10, do: assert_received({:upstream_called, %{id: {:new, _}}})
+
+    Cache.fetch(cache, req_a)
+
+    refute_received {:upstream_called, _},
+                    "A should still be cached after 10 eviction rounds of repeated touches"
   end
 end
