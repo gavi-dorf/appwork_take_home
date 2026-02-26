@@ -36,11 +36,25 @@ defmodule AppworkTakeHome.CacheTest.SpyUpstream do
   end
 end
 
+defmodule AppworkTakeHome.CacheTest.TTLSpyUpstream do
+  @moduledoc """
+  Instant upstream mock that returns responses with a TTL field.  The TTL
+  value is taken from the request params (`ttl: seconds`), and the spy
+  process (`spy: pid`) receives `{:upstream_called, params}` on every call.
+  """
+  alias AppworkTakeHome.{Request, Response}
+
+  def fetch(%Request{params: %{spy: pid, ttl: ttl} = params}) do
+    send(pid, {:upstream_called, params})
+    %Response{data: params, ttl: ttl}
+  end
+end
+
 defmodule AppworkTakeHome.CacheTest do
   use ExUnit.Case
 
   alias AppworkTakeHome.{Cache, Request, Response}
-  alias AppworkTakeHome.CacheTest.{DelayedUpstream, FastUpstream, SpyUpstream}
+  alias AppworkTakeHome.CacheTest.{DelayedUpstream, FastUpstream, SpyUpstream, TTLSpyUpstream}
 
   # Drains all `{tag, _}` messages from the test process mailbox and returns
   # the count.  Uses `after 0` so it never blocks.
@@ -343,5 +357,82 @@ defmodule AppworkTakeHome.CacheTest do
 
     refute_received {:upstream_called, _},
                     "A should still be cached after 10 eviction rounds of repeated touches"
+  end
+
+  # ---------------------------------------------------------------------------
+  # V2 → V3 behavioral contract
+  # These tests are @tagged :v3 and are expected to FAIL on V2 (no TTL).
+  # They become the green gate that confirms V3 (LRU + TTL) is correctly
+  # implemented.
+  # ---------------------------------------------------------------------------
+
+  @tag :v3
+  test "expired entry is re-fetched from upstream" do
+    # Core TTL test: after the TTL elapses, the cached response must be
+    # treated as invalid and the upstream must be called again.
+    {:ok, cache} = Cache.start_link(cap: 10, upstream: TTLSpyUpstream)
+    req = %Request{params: %{id: :ttl_basic, spy: self(), ttl: 1}}
+
+    # miss: upstream called, response cached with ttl=1s
+    Cache.fetch(cache, req)
+    assert_received {:upstream_called, %{id: :ttl_basic}}
+
+    # hit: within TTL window
+    Cache.fetch(cache, req)
+    refute_received {:upstream_called, _}, "should be a cache hit before TTL expires"
+
+    # wait for TTL to expire
+    Process.sleep(1_100)
+
+    # miss: TTL expired, upstream must be called again
+    Cache.fetch(cache, req)
+
+    assert_received {:upstream_called, %{id: :ttl_basic}},
+                    "expired entry should trigger an upstream re-fetch"
+  end
+
+  @tag :v3
+  test "non-expired entry is served from cache (TTL does not break normal hits)" do
+    # With a long TTL, the entry must remain a cache hit — TTL support
+    # must not accidentally invalidate every entry.
+    {:ok, cache} = Cache.start_link(cap: 10, upstream: TTLSpyUpstream)
+    req = %Request{params: %{id: :long_ttl, spy: self(), ttl: 60}}
+
+    # miss
+    Cache.fetch(cache, req)
+    assert_received {:upstream_called, %{id: :long_ttl}}
+
+    # hit (well within 60s TTL)
+    Cache.fetch(cache, req)
+    refute_received {:upstream_called, _}, "entry with 60s TTL should still be cached"
+
+    # hit again
+    Cache.fetch(cache, req)
+    refute_received {:upstream_called, _}, "entry with 60s TTL should still be cached on third fetch"
+  end
+
+  @tag :v3
+  test "re-fetched expired entry resets its TTL" do
+    # After an expired entry is re-fetched, the new response's TTL
+    # applies.  The entry must not immediately expire again.
+    {:ok, cache} = Cache.start_link(cap: 10, upstream: TTLSpyUpstream)
+    req = %Request{params: %{id: :ttl_reset, spy: self(), ttl: 1}}
+
+    # miss → cached with ttl=1s
+    Cache.fetch(cache, req)
+    assert_received {:upstream_called, %{id: :ttl_reset}}
+
+    # wait for expiry
+    Process.sleep(1_100)
+
+    # miss → re-fetched, new TTL starts now
+    Cache.fetch(cache, req)
+    assert_received {:upstream_called, %{id: :ttl_reset}}
+
+    Process.sleep(500)
+
+    # after re-fetch, the entry should be a hit (we are still within the TTL)
+    Cache.fetch(cache, req)
+    refute_received {:upstream_called, _}, "re-fetched entry should have a fresh TTL"
   end
 end
