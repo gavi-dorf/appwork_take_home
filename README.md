@@ -12,3 +12,134 @@
     To mitigate this would require either making the Cache GenServer even more of a bottleneck (by having one single GenServer/locking mechanism or a GenServer/locking mechanism for each key/request) and/or tracking in-flight requests and serving the stale response while requests are still busy processing.
 
     Since we don't know which of a) high concurrency, b) avoiding stale responses or c) not overloading the upstream is more important, it is justifiable for now to keep the implementation simpler and not yet add mitigation for Thundering Herd
+
+## Architecture Diagrams
+
+### Module Diagram
+
+```mermaid
+classDiagram
+    class Cache {
+        <<GenServer>>
+        +start_link(opts) GenServer.on_start()
+        +fetch(cache, request) Response.t()
+        -init(opts)
+        -handle_call(:touch, ...)
+        -handle_call(:put, ...)
+        -terminate(reason, state)
+        -maybe_evict(state)
+        -expired?(response, inserted_at)
+        -resolve_pid(cache)
+    }
+
+    class Upstream {
+        <<Behaviour>>
+        +fetch(Request.t()) Response.t()
+    }
+
+    class Request {
+        <<Struct>>
+        +params : term()
+        +cache_key(request) integer()
+    }
+
+    class Response {
+        <<Struct>>
+        +data : term()
+        +ttl : pos_integer()
+        +ttl(response) pos_integer()
+    }
+
+    class GenServerState {
+        <<Map>>
+        table : ets_ref
+        order_table : ets_ref
+        cap : pos_integer
+    }
+
+    class MainTable["ETS: Main Store (set)"] {
+        key : integer
+        counter : integer
+        response : Response.t()
+        inserted_at : integer
+    }
+
+    class OrderTable["ETS: LRU Order (ordered_set)"] {
+        counter : integer
+        key : integer
+    }
+
+    Cache --> Upstream : delegates misses to
+    Cache --> Request : reads cache_key from
+    Cache --> Response : stores and returns
+    Cache --> GenServerState : internal state
+    Cache --> MainTable : concurrent reads, serialised writes
+    Cache --> OrderTable : LRU ordering (private)
+    MainTable <..> OrderTable : counter links entries
+```
+
+### Data Flow
+
+```mermaid
+flowchart TD
+    Caller["Caller Process"]
+    Fetch["fetch(cache, request)"]
+    Key["Request.cache_key(request)"]
+    PT["persistent_term.get → {table, upstream}"]
+    ETS["ETS lookup (lock-free)"]
+
+    Hit{"HIT"}
+    Miss{"MISS"}
+    TTL{"TTL valid?"}
+
+    UpstreamCall["upstream.fetch(request) (concurrent, outside GenServer)"]
+    Touch["GenServer :touch (update LRU counter)"]
+    Put["GenServer :put (insert + maybe evict LRU)"]
+
+    Return["Return Response"]
+
+    Caller --> Fetch --> Key --> PT --> ETS
+    ETS --> Hit
+    ETS --> Miss
+
+    Hit --> TTL
+    TTL -- "Yes" --> Touch --> Return
+    TTL -- "No (expired)" --> UpstreamCall
+    Miss --> UpstreamCall
+
+    UpstreamCall --> Put --> Return
+```
+
+### Concurrency Design
+
+```mermaid
+flowchart LR
+    subgraph Callers["Concurrent Caller Processes"]
+        C1["Caller 1"]
+        C2["Caller 2"]
+        C3["Caller N"]
+    end
+
+    subgraph ReadPath["Lock-Free Read Path"]
+        PT["persistent_term (zero-copy ETS ref + upstream)"]
+        ETS["ETS Main Table (read_concurrency: true)"]
+    end
+
+    subgraph WritePath["Serialised Write Path"]
+        GS["Cache GenServer"]
+        OT["ETS Order Table (ordered_set, private)"]
+    end
+
+    subgraph External["External"]
+        US["Upstream Service (implements Upstream behaviour)"]
+    end
+
+    C1 & C2 & C3 -- "1. resolve ETS ref" --> PT
+    C1 & C2 & C3 -- "2. concurrent read" --> ETS
+    C1 & C2 & C3 -. "3. miss/expired" .-> US
+    US -. "4. response" .-> GS
+    C1 & C2 & C3 -- "3. hit → touch" --> GS
+    GS -- "update counters" --> ETS
+    GS -- "maintain LRU order" --> OT
+```
+
