@@ -1,55 +1,3 @@
-defmodule AppworkTakeHome.CacheTest.FastUpstream do
-  @moduledoc "Instant upstream mock: returns %Response{data: params} with no delay."
-  alias AppworkTakeHome.{Request, Response}
-  def fetch(%Request{params: params}), do: %Response{data: params, ttl: 3600}
-end
-
-defmodule AppworkTakeHome.CacheTest.DelayedUpstream do
-  @moduledoc """
-  Upstream mock with a delay to make cache hits vs misses distinguishable by timing.
-  """
-  alias AppworkTakeHome.{Request, Response}
-  # This will still function as a constant due to Erlang's constant pools
-  # See here for more info:
-  # - https://github.com/discord/fastglobal
-  # - https://www.erlang.org/docs/17/efficiency_guide/processes
-  def delay_ms, do: 100
-
-  def fetch(%Request{params: params}) do
-    Process.sleep(delay_ms())
-    %Response{data: params, ttl: 3600}
-  end
-end
-
-defmodule AppworkTakeHome.CacheTest.SpyUpstream do
-  @moduledoc """
-  Instant upstream mock that notifies a designated listener process on every
-  call.  Include `spy: pid` in the request params; the listener receives
-  `{:upstream_called, params}` each time this upstream is invoked, enabling
-  deterministic hit/miss detection without timing sensitivity.
-  """
-  alias AppworkTakeHome.{Request, Response}
-
-  def fetch(%Request{params: %{spy: pid} = params}) do
-    send(pid, {:upstream_called, params})
-    %Response{data: params, ttl: 3600}
-  end
-end
-
-defmodule AppworkTakeHome.CacheTest.TTLSpyUpstream do
-  @moduledoc """
-  Instant upstream mock that returns responses with a TTL field.  The TTL
-  value is taken from the request params (`ttl: seconds`), and the spy
-  process (`spy: pid`) receives `{:upstream_called, params}` on every call.
-  """
-  alias AppworkTakeHome.{Request, Response}
-
-  def fetch(%Request{params: %{spy: pid, ttl: ttl} = params}) do
-    send(pid, {:upstream_called, params})
-    %Response{data: params, ttl: ttl}
-  end
-end
-
 defmodule AppworkTakeHome.CacheTest do
   use ExUnit.Case
 
@@ -162,13 +110,6 @@ defmodule AppworkTakeHome.CacheTest do
     assert elapsed < 5, "expected cache hits under cap, got #{elapsed}ms"
   end
 
-  # ---------------------------------------------------------------------------
-  # V1 → V2 behavioral contract
-  # This test is @tagged :v2 and is expected to FAIL on V1 (FIFO eviction).
-  # It becomes the green gate that confirms V2 (LRU) is correctly implemented.
-  # ---------------------------------------------------------------------------
-
-  @tag :v2
   test "cache hit on A keeps A alive when B would be LRU-evicted (LRU, not FIFO)" do
     req_a = %Request{params: %{id: :a}}
     req_b = %Request{params: %{id: :b}}
@@ -507,7 +448,6 @@ defmodule AppworkTakeHome.CacheTest do
     refute_received {:upstream_called, _}, "entry should be cached after concurrent re-fetches"
   end
 
-  @tag :v3
   test "expired entry re-fetch at capacity interacts correctly with LRU eviction" do
     # A full cache where one entry expires.  Re-fetching the expired entry
     # updates it in place (key already exists in ETS), so no eviction occurs.
