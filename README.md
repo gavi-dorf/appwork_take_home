@@ -47,7 +47,6 @@ classDiagram
         <<Struct>>
         +data : term()
         +ttl : pos_integer()
-        +ttl(response) pos_integer()
     }
 
     class GenServerState {
@@ -76,6 +75,8 @@ classDiagram
     Cache --> MainTable : concurrent reads, serialised writes
     Cache --> OrderTable : LRU ordering (private)
     MainTable <..> OrderTable : counter links entries
+
+    note "Solid line (──►) = direct dependency\nDotted line (┈┈►) = indirect association"
 ```
 
 ### Data Flow
@@ -139,7 +140,7 @@ flowchart LR
     C1 & C2 & C3 -. "3. miss/expired" .-> US
     US -. "4. response" .-> GS
     C1 & C2 & C3 -- "3. hit → touch" --> GS
-    GS -- "update counters" --> ETS
+    GS -- "update LRU counters" --> ETS
     GS -- "maintain LRU order" --> OT
 ```
 
