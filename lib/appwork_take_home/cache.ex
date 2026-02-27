@@ -126,26 +126,23 @@ defmodule AppworkTakeHome.Cache do
   def handle_call({:put, key, response}, _from, %{table: table, order_table: order_table} = state) do
     now = System.monotonic_time(:millisecond)
 
-    state =
-      if :ets.member(table, key) do
-        case :ets.lookup(table, key) do
-          [{^key, old_counter, _, _}] ->
-            new_counter = :erlang.unique_integer([:monotonic])
-            :ets.delete(order_table, old_counter)
-            :ets.insert(order_table, {new_counter, key})
-            :ets.update_element(table, key, [{2, new_counter}, {3, response}, {4, now}])
+    if :ets.member(table, key) do
+      case :ets.lookup(table, key) do
+        [{^key, old_counter, _, _}] ->
+          new_counter = :erlang.unique_integer([:monotonic])
+          :ets.delete(order_table, old_counter)
+          :ets.insert(order_table, {new_counter, key})
+          :ets.update_element(table, key, [{2, new_counter}, {3, response}, {4, now}])
 
-          [] ->
-            :ok
-        end
-
-        state
-      else
-        counter = :erlang.unique_integer([:monotonic])
-        :ets.insert(table, {key, counter, response, now})
-        :ets.insert(order_table, {counter, key})
-        maybe_evict(state)
+        [] ->
+          :ok
       end
+    else
+      counter = :erlang.unique_integer([:monotonic])
+      :ets.insert(table, {key, counter, response, now})
+      :ets.insert(order_table, {counter, key})
+      maybe_evict(state)
+    end
 
     {:reply, :ok, state}
   end
@@ -162,16 +159,15 @@ defmodule AppworkTakeHome.Cache do
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  defp maybe_evict(%{table: table, order_table: order_table, cap: cap} = state) do
+  defp maybe_evict(%{table: table, order_table: order_table, cap: cap}) do
     if :ets.info(table, :size) > cap do
       oldest_counter = :ets.first(order_table)
       [{^oldest_counter, lru_key}] = :ets.lookup(order_table, oldest_counter)
       :ets.delete(order_table, oldest_counter)
       :ets.delete(table, lru_key)
-      state
-    else
-      state
     end
+
+    :ok
   end
 
   defp expired?(%Response{ttl: ttl}, inserted_at) do
