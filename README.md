@@ -1,5 +1,35 @@
 # AppworkTakeHome
 
+A high-concurrency LRU cache with TTL support, written in Elixir. It sits in front of an upstream service, storing recent responses in ETS so that repeated requests are served instantly without hitting the upstream again. Writes and eviction are serialised through a GenServer while reads remain lock-free.
+
+## Quick start
+
+Define a module that implements the `Upstream` behaviour:
+
+```elixir
+defmodule MyUpstream do
+  @behaviour AppworkTakeHome.Upstream
+  alias AppworkTakeHome.{Request, Response}
+
+  def fetch(%Request{params: params}) do
+    # call the real service here
+    %Response{data: do_expensive_work(params), ttl: 60}
+  end
+end
+```
+
+Then start the cache and use it:
+
+```elixir
+alias AppworkTakeHome.{Cache, Request}
+
+{:ok, cache} = Cache.start_link(cap: 100, upstream: MyUpstream)
+
+request = %Request{params: %{id: 1}}
+response = Cache.fetch(cache, request)   # calls upstream
+response = Cache.fetch(cache, request)   # served from cache
+```
+
 ## Assumptions when interpreting instructions:
 1. "Uses request structs as keys and response structs as values...Same as V1, with the added constraint that the stored entries are distinct request-response tuples." - At the implementation level, the hash is used as the ETS key, and the value is the response
 2. "V1 - Basic Cache...It must store responses for at least the last CAP requests" - CAP is treated as maximum capacity and eviction occurs when capacity is exceeded
@@ -140,7 +170,7 @@ flowchart LR
     C1 & C2 & C3 -. "3. miss/expired" .-> US
     US -. "4. response" .-> GS
     C1 & C2 & C3 -- "3. hit → touch" --> GS
-    GS -- "update LRU counters" --> ETS
+    GS -- "update LRU counter" --> ETS
     GS -- "maintain LRU order" --> OT
 ```
 
