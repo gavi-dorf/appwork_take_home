@@ -11,6 +11,6 @@ defmodule AppworkTakeHome.SlowUpstream do
     Process.sleep(100)
 
     # Use the hash function again just as a way of generating data that is deterministic based on the input params. In a real implementation, this would be the actual data returned from the upstream service.
-    %AppworkTakeHome.Response{data: :erlang.phash2(params)}
+    %AppworkTakeHome.Response{data: :erlang.phash2(params), ttl: 60}
   end
 end

@@ -1,7 +1,7 @@
 defmodule AppworkTakeHome.CacheTest.FastUpstream do
   @moduledoc "Instant upstream mock: returns %Response{data: params} with no delay."
   alias AppworkTakeHome.{Request, Response}
-  def fetch(%Request{params: params}), do: %Response{data: params}
+  def fetch(%Request{params: params}), do: %Response{data: params, ttl: 3600}
 end
 
 defmodule AppworkTakeHome.CacheTest.DelayedUpstream do
@@ -17,7 +17,7 @@ defmodule AppworkTakeHome.CacheTest.DelayedUpstream do
 
   def fetch(%Request{params: params}) do
     Process.sleep(delay_ms())
-    %Response{data: params}
+    %Response{data: params, ttl: 3600}
   end
 end
 
@@ -32,7 +32,7 @@ defmodule AppworkTakeHome.CacheTest.SpyUpstream do
 
   def fetch(%Request{params: %{spy: pid} = params}) do
     send(pid, {:upstream_called, params})
-    %Response{data: params}
+    %Response{data: params, ttl: 3600}
   end
 end
 
@@ -114,7 +114,7 @@ defmodule AppworkTakeHome.CacheTest do
     req = %Request{params: %{id: 1}}
     {:ok, cache} = Cache.start_link(cap: 10, upstream: FastUpstream)
 
-    assert Cache.fetch(cache, req) == %Response{data: %{id: 1}}
+    assert %Response{data: %{id: 1}} = Cache.fetch(cache, req)
   end
 
   test "repeated fetch returns the cached response" do
@@ -142,7 +142,7 @@ defmodule AppworkTakeHome.CacheTest do
     Cache.fetch(cache, req_c)
 
     # A was evicted; re-fetching should still return the correct value
-    assert Cache.fetch(cache, req_a) == %Response{data: %{id: :a}}
+    assert %Response{data: %{id: :a}} = Cache.fetch(cache, req_a)
   end
 
   test "no eviction when at or below capacity" do
@@ -244,7 +244,8 @@ defmodule AppworkTakeHome.CacheTest do
       )
       |> Enum.map(fn {:ok, result} -> result end)
 
-    assert Enum.all?(results, &(&1 == %Response{data: %{id: :shared, spy: self()}}))
+    me = self()
+    assert Enum.all?(results, &match?(%Response{data: %{id: :shared, spy: ^me}}, &1))
 
     # There should only be one upstream call for the shared key, not n calls.
     assert drain_count(:upstream_called) == 1,
@@ -359,14 +360,71 @@ defmodule AppworkTakeHome.CacheTest do
                     "A should still be cached after 10 eviction rounds of repeated touches"
   end
 
-  # ---------------------------------------------------------------------------
-  # V2 → V3 behavioral contract
-  # These tests are @tagged :v3 and are expected to FAIL on V2 (no TTL).
-  # They become the green gate that confirms V3 (LRU + TTL) is correctly
-  # implemented.
-  # ---------------------------------------------------------------------------
+  test "touch of an already-evicted key is a harmless no-op" do
+    # Exercises the empty-lookup branch in handle_call({:touch, key})
+    # This race can occur when a process reads an entry from ETS
+    # and then another process evicts that entry before the :touch call arrives
+    # at the GenServer.  We test both the deterministic path (direct GenServer
+    # call) and a probabilistic stress path.
 
-  @tag :v3
+    # Part 1: deterministic — directly touch a key that was never inserted.
+    {:ok, cache} = Cache.start_link(cap: 2, upstream: SpyUpstream)
+    assert GenServer.call(cache, {:touch, :nonexistent_key}) == :ok
+
+    # Part 2: stress — rapidly alternate two keys with cap=1 to provoke
+    # the race between concurrent ETS reads and serialized evictions.
+    {:ok, cache2} = Cache.start_link(cap: 1, upstream: SpyUpstream)
+
+    req_a = %Request{params: %{id: :race_a, spy: self()}}
+    req_b = %Request{params: %{id: :race_b, spy: self()}}
+
+    for _ <- 1..100 do
+      Task.async(fn -> Cache.fetch(cache2, req_a) end)
+      Task.async(fn -> Cache.fetch(cache2, req_b) end)
+    end
+    |> Enum.each(&Task.await/1)
+
+    # If the no-op branch crashed, we would never reach this point.
+    drain_count(:upstream_called)
+    assert true
+  end
+
+  test "concurrent misses on different keys exceeding capacity" do
+    # Many concurrent first-fetches for distinct keys when total keys > capacity.
+    # Multiple concurrent puts arriving at the GenServer can each trigger
+    # eviction.  Tests that eviction remains correct under concurrent pressure.
+    cap = 5
+    n = 20
+    {:ok, cache} = Cache.start_link(cap: cap, upstream: SpyUpstream)
+
+    requests = Enum.map(1..n, fn i -> %Request{params: %{id: {:conc, i}, spy: self()}} end)
+
+    # All concurrent misses
+    results =
+      requests
+      |> Task.async_stream(&Cache.fetch(cache, &1), max_concurrency: n, timeout: 5_000)
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    # All must return the correct response
+    for {req, result} <- Enum.zip(requests, results) do
+      assert %Response{data: data} = result
+      assert data == req.params
+    end
+
+    # All n keys should have triggered upstream calls
+    initial_calls = drain_count(:upstream_called)
+    assert initial_calls == n, "expected #{n} initial upstream calls, got #{initial_calls}"
+
+    # After all concurrent puts + evictions, exactly `cap` entries must remain.
+    # Access the ETS table via persistent_term to check size directly, avoiding
+    # cascading evictions that sequential re-fetches would cause.
+    %{table: table} = :persistent_term.get({Cache, cache})
+    size = :ets.info(table, :size)
+
+    assert size == cap,
+           "expected #{cap} entries in cache after #{n} concurrent inserts, got #{size}"
+  end
+
   test "expired entry is re-fetched from upstream" do
     # Core TTL test: after the TTL elapses, the cached response must be
     # treated as invalid and the upstream must be called again.
@@ -391,7 +449,6 @@ defmodule AppworkTakeHome.CacheTest do
                     "expired entry should trigger an upstream re-fetch"
   end
 
-  @tag :v3
   test "non-expired entry is served from cache (TTL does not break normal hits)" do
     # With a long TTL, the entry must remain a cache hit — TTL support
     # must not accidentally invalidate every entry.
@@ -408,10 +465,92 @@ defmodule AppworkTakeHome.CacheTest do
 
     # hit again
     Cache.fetch(cache, req)
-    refute_received {:upstream_called, _}, "entry with 60s TTL should still be cached on third fetch"
+
+    refute_received {:upstream_called, _},
+                    "entry with 60s TTL should still be cached on third fetch"
+  end
+
+  test "concurrent re-fetches of the same expired entry all succeed without crash" do
+    # When multiple processes discover the same expired entry simultaneously,
+    # they all call upstream.fetch then GenServer.call(:put).  The :put handler
+    # must handle the duplicate puts gracefully (via the ets.member branch).
+    {:ok, cache} = Cache.start_link(cap: 10, upstream: TTLSpyUpstream)
+    req = %Request{params: %{id: :ttl_race, spy: self(), ttl: 1}}
+
+    # miss → cached with ttl=1s
+    Cache.fetch(cache, req)
+    assert_received {:upstream_called, %{id: :ttl_race}}
+
+    # wait for expiry
+    Process.sleep(1_100)
+
+    # launch N concurrent fetches — all see the expired entry
+    n = 20
+
+    results =
+      1..n
+      |> Task.async_stream(fn _ -> Cache.fetch(cache, req) end,
+        max_concurrency: n,
+        timeout: 5_000
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    # all callers must get the correct response
+    assert Enum.all?(
+             results,
+             &(&1 == %Response{data: %{id: :ttl_race, spy: self(), ttl: 1}, ttl: 1})
+           )
+
+    # the entry must be properly cached afterwards
+    drain_count(:upstream_called)
+    Cache.fetch(cache, req)
+    refute_received {:upstream_called, _}, "entry should be cached after concurrent re-fetches"
   end
 
   @tag :v3
+  test "expired entry re-fetch at capacity interacts correctly with LRU eviction" do
+    # A full cache where one entry expires.  Re-fetching the expired entry
+    # updates it in place (key already exists in ETS), so no eviction occurs.
+    # A subsequent new key insert must evict the true LRU (the untouched entry).
+    {:ok, cache} = Cache.start_link(cap: 2, upstream: TTLSpyUpstream)
+
+    req_a = %Request{params: %{id: :mix_a, spy: self(), ttl: 1}}
+    req_b = %Request{params: %{id: :mix_b, spy: self(), ttl: 60}}
+
+    # miss: cache [A(ttl=1s), B(ttl=60s)]
+    Cache.fetch(cache, req_a)
+    Cache.fetch(cache, req_b)
+    assert_received {:upstream_called, %{id: :mix_a}}
+    assert_received {:upstream_called, %{id: :mix_b}}
+
+    # wait for A to expire
+    Process.sleep(1_100)
+
+    # A is expired → re-fetch → :put updates A in place (no eviction since key exists)
+    Cache.fetch(cache, req_a)
+    assert_received {:upstream_called, %{id: :mix_a}}
+
+    # A's counter was refreshed by the :put, so B is now the LRU.
+    # Insert C → evicts B (LRU)
+    req_c = %Request{params: %{id: :mix_c, spy: self(), ttl: 60}}
+    Cache.fetch(cache, req_c)
+    assert_received {:upstream_called, %{id: :mix_c}}
+
+    # A should be cached (was just re-fetched)
+    Cache.fetch(cache, req_a)
+    refute_received {:upstream_called, _}, "A should be cached after re-fetch"
+
+    # C should be cached (just inserted)
+    Cache.fetch(cache, req_c)
+    refute_received {:upstream_called, _}, "C should be cached"
+
+    # B should have been evicted (it was the LRU when C was inserted)
+    Cache.fetch(cache, req_b)
+
+    assert_received {:upstream_called, %{id: :mix_b}},
+                    "B should have been evicted as LRU when C was inserted"
+  end
+
   test "re-fetched expired entry resets its TTL" do
     # After an expired entry is re-fetched, the new response's TTL
     # applies.  The entry must not immediately expire again.

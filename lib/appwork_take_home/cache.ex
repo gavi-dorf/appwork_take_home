@@ -32,7 +32,7 @@ defmodule AppworkTakeHome.Cache do
 
   use GenServer
 
-  alias AppworkTakeHome.{Request, Response, SlowUpstream}
+  alias AppworkTakeHome.{Request, Response}
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -44,7 +44,7 @@ defmodule AppworkTakeHome.Cache do
   ## Options
 
     * `:cap` — maximum number of entries (required)
-    * `:upstream` — module implementing `fetch/1` (default: `SlowUpstream`)
+    * `:upstream` — module implementing `fetch/1` (required)
     * `:name` — registered name for the process
 
   """
@@ -96,7 +96,7 @@ defmodule AppworkTakeHome.Cache do
   @impl true
   def init(opts) do
     cap = Keyword.fetch!(opts, :cap)
-    upstream = Keyword.get(opts, :upstream, SlowUpstream)
+    upstream = Keyword.fetch!(opts, :upstream)
 
     table = :ets.new(__MODULE__, [:public, {:read_concurrency, true}])
     order_table = :ets.new(:lru_order, [:ordered_set, :private])
@@ -173,8 +173,6 @@ defmodule AppworkTakeHome.Cache do
       state
     end
   end
-
-  defp expired?(%Response{ttl: nil}, _inserted_at), do: false
 
   defp expired?(%Response{ttl: ttl}, inserted_at) do
     System.monotonic_time(:millisecond) - inserted_at >= ttl * 1_000
