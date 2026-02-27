@@ -8,14 +8,17 @@ defmodule AppworkTakeHome.Cache do
   via `:persistent_term` so that `fetch/2` can reach them without going
   through the GenServer on either the read or the upstream-call path.
 
-  Eviction is LRU (V2). A cache hit moves the entry to the most-recently-used
-  position, so only entries not accessed within the last CAP distinct requests
-  are evicted.
+  Eviction is LRU with optional TTL (V3). A cache hit moves the entry to the
+  most-recently-used position, so only entries not accessed within the last CAP
+  distinct requests are evicted.  Entries whose TTL has elapsed are treated as
+  cache misses and re-fetched from the upstream.
 
   Two ETS tables maintain the LRU order:
 
-    * `table` — the main store: `{key, counter, response}`. The counter is a
-      monotonic integer that encodes the entry's last-access time.
+    * `table` — the main store: `{key, counter, response, inserted_at}`.
+      The counter is a monotonic integer that encodes the entry's last-access
+      time.  `inserted_at` is a monotonic timestamp (milliseconds) used for
+      TTL expiration checks.
     * `order_table` — an `:ordered_set` keyed by counter: `{counter, key}`.
       Because `:ordered_set` sorts ascending, `:ets.first/1` always returns
       the LRU entry's counter in O(log n) because ordered_set is implemented
@@ -69,9 +72,15 @@ defmodule AppworkTakeHome.Cache do
     %{table: table, upstream: upstream} = :persistent_term.get({__MODULE__, pid})
 
     case :ets.lookup(table, key) do
-      [{^key, _counter, response}] ->
-        GenServer.call(cache, {:touch, key})
-        response
+      [{^key, _counter, response, inserted_at}] ->
+        if expired?(response, inserted_at) do
+          response = upstream.fetch(request)
+          GenServer.call(cache, {:put, key, response})
+          response
+        else
+          GenServer.call(cache, {:touch, key})
+          response
+        end
 
       [] ->
         response = upstream.fetch(request)
@@ -99,7 +108,7 @@ defmodule AppworkTakeHome.Cache do
   @impl true
   def handle_call({:touch, key}, _from, %{table: table, order_table: order_table} = state) do
     case :ets.lookup(table, key) do
-      [{^key, old_counter, _response}] ->
+      [{^key, old_counter, _response, _inserted_at}] ->
         new_counter = :erlang.unique_integer([:monotonic])
         :ets.delete(order_table, old_counter)
         :ets.insert(order_table, {new_counter, key})
@@ -115,26 +124,25 @@ defmodule AppworkTakeHome.Cache do
 
   @impl true
   def handle_call({:put, key, response}, _from, %{table: table, order_table: order_table} = state) do
+    now = System.monotonic_time(:millisecond)
+
     state =
       if :ets.member(table, key) do
-        # A concurrent caller already inserted this key.  Treat as a touch so
-        # the entry moves to the MRU position rather than being silently skipped.
         case :ets.lookup(table, key) do
-          [{^key, old_counter, _}] ->
+          [{^key, old_counter, _, _}] ->
             new_counter = :erlang.unique_integer([:monotonic])
             :ets.delete(order_table, old_counter)
             :ets.insert(order_table, {new_counter, key})
-            :ets.update_element(table, key, [{2, new_counter}])
+            :ets.update_element(table, key, [{2, new_counter}, {3, response}, {4, now}])
 
           [] ->
-            # Evicted between the member check and lookup; nothing to do.
             :ok
         end
 
         state
       else
         counter = :erlang.unique_integer([:monotonic])
-        :ets.insert(table, {key, counter, response})
+        :ets.insert(table, {key, counter, response, now})
         :ets.insert(order_table, {counter, key})
         maybe_evict(state)
       end
@@ -164,6 +172,12 @@ defmodule AppworkTakeHome.Cache do
     else
       state
     end
+  end
+
+  defp expired?(%Response{ttl: nil}, _inserted_at), do: false
+
+  defp expired?(%Response{ttl: ttl}, inserted_at) do
+    System.monotonic_time(:millisecond) - inserted_at >= ttl * 1_000
   end
 
   defp resolve_pid(pid) when is_pid(pid), do: pid
