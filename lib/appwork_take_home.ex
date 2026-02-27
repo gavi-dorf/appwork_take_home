@@ -1,2 +1,0 @@
-defmodule AppworkTakeHome do
-end

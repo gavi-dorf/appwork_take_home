@@ -14,15 +14,13 @@ defmodule AppworkTakeHome.CacheTest do
     end
   end
 
-  @cache AppworkTakeHome.Cache
-
   test "100 concurrent requests prove both concurrency and caching" do
     n = 100
     upstream = DelayedUpstream
     upstream_latency_ms = upstream.delay_ms()
     requests = Enum.map(1..n, fn i -> %Request{params: %{n: i}} end)
 
-    {:ok, cache} = @cache.start_link(cap: n, upstream: DelayedUpstream)
+    {:ok, cache} = Cache.start_link(cap: n, upstream: DelayedUpstream)
 
     # Phase 1: all unique (cache misses) — proves concurrency.
     # Sequential baseline: n × upstream_latency_ms = 10,000ms.
@@ -30,7 +28,7 @@ defmodule AppworkTakeHome.CacheTest do
     t1 = System.monotonic_time(:millisecond)
 
     requests
-    |> Task.async_stream(&@cache.fetch(cache, &1), max_concurrency: n, timeout: 30_000)
+    |> Task.async_stream(&Cache.fetch(cache, &1), max_concurrency: n, timeout: 30_000)
     |> Stream.run()
 
     elapsed1 = System.monotonic_time(:millisecond) - t1
@@ -40,7 +38,7 @@ defmodule AppworkTakeHome.CacheTest do
     t2 = System.monotonic_time(:millisecond)
 
     requests
-    |> Task.async_stream(&@cache.fetch(cache, &1), max_concurrency: n, timeout: 30_000)
+    |> Task.async_stream(&Cache.fetch(cache, &1), max_concurrency: n, timeout: 30_000)
     |> Stream.run()
 
     elapsed2 = System.monotonic_time(:millisecond) - t2
